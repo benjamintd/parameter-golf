@@ -60,9 +60,10 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    depth = int(os.environ.get("DEPTH", 12))
-    num_experts = int(os.environ.get("NUM_EXPERTS", 8))
+    depth = int(os.environ.get("DEPTH", 2))
+    num_experts = int(os.environ.get("NUM_EXPERTS", 3))
     mlp_mult = int(os.environ.get("MLP_MULT", 4))
+    expert_depth = int(os.environ.get("EXPERT_DEPTH", 2))  # layers per expert
     top_k = int(os.environ.get("TOP_K", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -222,16 +223,32 @@ class SpeedrunMoE(nn.Module):
     learned adaptive halting for depth recurrence.
     """
 
-    def __init__(self, dim: int, hidden_dim: int, num_experts: int = 64, top_k: int = 2):
+    def __init__(self, dim: int, hidden_dim: int, num_experts: int = 64, top_k: int = 2,
+                 expert_depth: int = 1):
         super().__init__()
         self.num_experts = num_experts
         self.num_real_experts = num_experts - 1
         self.top_k = top_k
+        self.expert_depth = expert_depth
         self.router = nn.Linear(dim, num_experts, bias=False)
-        self.w1 = nn.Parameter(torch.empty(self.num_real_experts, dim, hidden_dim))
-        self.w2 = nn.Parameter(torch.empty(self.num_real_experts, hidden_dim, dim))
-        nn.init.orthogonal_(self.w1)
-        nn.init.orthogonal_(self.w2)
+
+        # Each expert is a multi-layer MLP: dim -> hidden -> hidden -> ... -> dim
+        # Layer 0: dim -> hidden_dim (up-projection)
+        # Layers 1..depth-2: hidden_dim -> hidden_dim (intermediate)
+        # Layer -1: hidden_dim -> dim (down-projection)
+        self.w_up = nn.Parameter(torch.empty(self.num_real_experts, dim, hidden_dim))
+        self.w_down = nn.Parameter(torch.empty(self.num_real_experts, hidden_dim, dim))
+        nn.init.orthogonal_(self.w_up)
+        nn.init.orthogonal_(self.w_down)
+
+        # Intermediate layers (if expert_depth > 1)
+        if expert_depth > 1:
+            self.w_mid = nn.ParameterList([
+                nn.Parameter(torch.empty(self.num_real_experts, hidden_dim, hidden_dim))
+                for _ in range(expert_depth - 1)
+            ])
+            for w in self.w_mid:
+                nn.init.orthogonal_(w)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         B, T, D = x.shape
@@ -257,15 +274,16 @@ class SpeedrunMoE(nn.Module):
             if pass_mask.any():
                 out[pass_mask] += x_flat[pass_mask] * weights[pass_mask]
 
-            # Real experts
+            # Real experts (deep MLP: up -> [mid ->]* down)
             for i in range(self.num_real_experts):
                 mask = expert_indices == (i + 1)
                 if not mask.any():
                     continue
-                tok = x_flat[mask]
-                h = F.relu(tok @ self.w1[i])
-                expert_out = h @ self.w2[i]
-                out[mask] += expert_out * weights[mask]
+                h = F.relu(x_flat[mask] @ self.w_up[i])
+                if self.expert_depth > 1:
+                    for w in self.w_mid:
+                        h = F.relu(h @ w[i])
+                out[mask] += (h @ self.w_down[i]) * weights[mask]
 
         return out.view(B, T, D), latent_reg_loss
 
@@ -279,10 +297,11 @@ class GolfModel(nn.Module):
         vocab_size: int = 1024,
         dim: int = 512,
         num_heads: int = 8,
-        depth: int = 12,
-        num_experts: int = 64,
-        mlp_mult: int = 2,
+        depth: int = 2,
+        num_experts: int = 8,
+        mlp_mult: int = 4,
         top_k: int = 2,
+        expert_depth: int = 3,
         max_seq_len: int = 1024,
         tie_embeddings: bool = True,
         rope_base: float = 10000.0,
@@ -300,7 +319,7 @@ class GolfModel(nn.Module):
         self.embed = nn.Embedding(vocab_size, dim)
         self.attn_qkv = nn.Linear(dim, dim * 3, bias=False)
         self.attn_proj = nn.Linear(dim, dim, bias=False)
-        self.shared_moe = SpeedrunMoE(dim, hidden_dim=dim * mlp_mult, num_experts=num_experts, top_k=top_k)
+        self.shared_moe = SpeedrunMoE(dim, hidden_dim=dim * mlp_mult, num_experts=num_experts, top_k=top_k, expert_depth=expert_depth)
         self.norm = nn.RMSNorm(dim)
 
         if not tie_embeddings:
@@ -561,7 +580,7 @@ def dequantize_int6_per_row(q: Tensor, scale: Tensor) -> Tensor:
 def quantize_state_dict(state_dict: dict[str, Tensor], int6_keys: set[str] | None = None):
     """Quantize a state dict. Keys in int6_keys get int6, rest get fp16."""
     if int6_keys is None:
-        int6_keys = {"shared_moe.w1", "shared_moe.w2"}
+        int6_keys = {k for k in (state_dict.keys() if hasattr(state_dict, 'keys') else []) if "shared_moe.w_" in k and "router" not in k}
     quantized = {}
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
@@ -577,7 +596,8 @@ def quantize_state_dict(state_dict: dict[str, Tensor], int6_keys: set[str] | Non
 def dequantize_state_dict(quantized: dict[str, Tensor], int6_keys: set[str] | None = None):
     """Reverse of quantize_state_dict."""
     if int6_keys is None:
-        int6_keys = {"shared_moe.w1", "shared_moe.w2"}
+        # Infer int6 keys from the quantized dict (they have .q/.s suffixes)
+        int6_keys = {k[:-2] for k in quantized.keys() if k.endswith(".q")}
     state_dict = {}
     for name in int6_keys:
         q = quantized[name + ".q"]
@@ -803,6 +823,7 @@ def main() -> None:
         num_experts=args.num_experts,
         mlp_mult=args.mlp_mult,
         top_k=args.top_k,
+        expert_depth=args.expert_depth,
         max_seq_len=args.train_seq_len,
         tie_embeddings=args.tie_embeddings,
         rope_base=args.rope_base,
@@ -820,11 +841,13 @@ def main() -> None:
 
     # --- Optimizers: Muon for matrices, AdamW for scalars ---
     matrix_params = [
-        raw_model.shared_moe.w1,
-        raw_model.shared_moe.w2,
+        raw_model.shared_moe.w_up,
+        raw_model.shared_moe.w_down,
         raw_model.attn_qkv.weight,
         raw_model.attn_proj.weight,
     ]
+    if hasattr(raw_model.shared_moe, "w_mid"):
+        matrix_params.extend(list(raw_model.shared_moe.w_mid))
     scalar_params = [
         raw_model.embed.weight,
         raw_model.norm.weight,
