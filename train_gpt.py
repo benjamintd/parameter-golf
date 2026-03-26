@@ -61,8 +61,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     depth = int(os.environ.get("DEPTH", 12))
-    num_experts = int(os.environ.get("NUM_EXPERTS", 64))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    num_experts = int(os.environ.get("NUM_EXPERTS", 8))
+    mlp_mult = int(os.environ.get("MLP_MULT", 4))
     top_k = int(os.environ.get("TOP_K", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -260,7 +260,7 @@ class SpeedrunMoE(nn.Module):
 
             # Chunked gather+bmm to avoid OOM on large batches
             # Each chunk gathers at most CHUNK tokens' worth of expert weights
-            CHUNK = 4096
+            CHUNK = 16384
             real_out = torch.empty_like(real_tokens)
             for start in range(0, real_mask.numel(), CHUNK):
                 end = min(start + CHUNK, real_mask.numel())
