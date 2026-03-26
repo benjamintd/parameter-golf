@@ -640,12 +640,26 @@ def eval_val(
     mixer: BackoffNgramMixer | None = None,
 ) -> tuple[float, float]:
     """Compute val_loss (nats) and val_bpb (bits/byte) on validation tokens.
-    If mixer is provided and model has ngram_gate, uses mixed predictions."""
+
+    If mixer is provided and model has ngram_gate, uses backward-looking
+    score-first protocol: score each chunk with the oracle built from
+    *previously scored* chunks only (never the current chunk). This ensures
+    no future data leaks into n-gram statistics.
+    """
     if seq_len is None:
         seq_len = args.train_seq_len
     model.eval()
     raw_model = model.module if hasattr(model, "module") else model
-    use_mixer = mixer is not None and raw_model.ngram_gate is not None and mixer.total_tokens > 0
+    use_mixer = raw_model.ngram_gate is not None
+
+    # If using mixer at eval, start with a FRESH empty oracle
+    # (the training oracle must not be used — only val tokens seen so far)
+    eval_mixer = None
+    if use_mixer and mixer is not None:
+        eval_mixer = BackoffNgramMixer(
+            vocab_size=args.vocab_size, device=str(device),
+            buckets=mixer.BUCKETS,
+        )
 
     bb = base_bytes_lut.to(device)
     hls = has_leading_space_lut.to(device)
@@ -669,14 +683,13 @@ def eval_val(
         y = local[1:].reshape(-1, seq_len)
         batch_token_count = y.numel()
 
-        if use_mixer:
+        if eval_mixer is not None and eval_mixer.total_tokens > 0:
+            # Score with mixer using oracle built from PREVIOUS chunks only
             logits, gate_logits = raw_model.forward_with_gate(x)
-            # Compute mixed NLL using n-gram probabilities
-            order_p, order_valid = mixer.ngram_probs(x, y)
+            order_p, order_valid = eval_mixer.ngram_probs(x, y)
             bsz, slen = y.shape
             neural_lp = F.log_softmax(logits.float(), dim=-1)
-            neural_p = neural_lp.gather(2, y.unsqueeze(2)).squeeze(2)
-            neural_p = neural_p.exp()
+            neural_p = neural_lp.gather(2, y.unsqueeze(2)).squeeze(2).exp()
             expert_p = torch.cat([neural_p.unsqueeze(-1), order_p], dim=-1)
             valid_mask = torch.cat([
                 torch.ones(bsz, slen, 1, device=device, dtype=torch.bool),
@@ -688,11 +701,14 @@ def eval_val(
             other_w = 0.95 * weights[..., 1:]
             weights = torch.cat([neural_w, other_w], dim=-1)
             mixed_p = (weights * expert_p).sum(dim=-1)
-            batch_nll = -torch.log(mixed_p.clamp(min=1e-12))
-            batch_loss = batch_nll.sum() / batch_token_count
+            batch_loss = (-torch.log(mixed_p.clamp(min=1e-12))).sum() / batch_token_count
         else:
             logits = raw_model(x)
             batch_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+
+        # AFTER scoring, update the eval oracle with this chunk's tokens
+        if eval_mixer is not None:
+            eval_mixer.update(local.reshape(-1))
 
         total_loss += batch_loss.to(acc_dtype) * batch_token_count
         total_tokens += batch_token_count
