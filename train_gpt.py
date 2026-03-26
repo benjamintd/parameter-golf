@@ -900,18 +900,12 @@ def main() -> None:
             x = tokens[:-1].reshape(micro_batch_seqs, args.train_seq_len)
             y = tokens[1:].reshape(micro_batch_seqs, args.train_seq_len)
 
-            # Compute n-gram probabilities (frozen, no grad)
-            ngram_kw = {}
-            if mixer is not None and mixer.total_tokens > 0:
-                with torch.no_grad():
-                    order_p, order_valid = mixer.ngram_probs(x, y)
-                ngram_kw = dict(ngram_order_p=order_p, ngram_order_valid=order_valid)
-
+            # N-gram mixer used only at eval (ngram_probs too slow for training)
             if device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = model(x, y, **ngram_kw) * grad_scale
+                    loss = model(x, y) * grad_scale
             else:
-                loss = model(x, y, **ngram_kw) * grad_scale
+                loss = model(x, y) * grad_scale
             loss.backward()
             accum_loss += loss.item()
             total_tokens_seen += y.numel() * world_size
