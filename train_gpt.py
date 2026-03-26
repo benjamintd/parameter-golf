@@ -66,6 +66,10 @@ class Hyperparameters:
     top_k = int(os.environ.get("TOP_K", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    # N-gram mixer
+    ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
+    ngram_mixer_loss_weight = float(os.environ.get("NGRAM_MIXER_LOSS_WEIGHT", 0.5))
+    ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", 1_048_576))
 
     # Optimizer
     muon_lr = float(os.environ.get("MUON_LR", 0.025))
@@ -279,6 +283,8 @@ class GolfModel(nn.Module):
         max_seq_len: int = 1024,
         tie_embeddings: bool = True,
         rope_base: float = 10000.0,
+        ngram_enabled: bool = False,
+        ngram_mixer_loss_weight: float = 0.5,
     ):
         super().__init__()
         self.depth = depth
@@ -286,6 +292,7 @@ class GolfModel(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.tie_embeddings = tie_embeddings
+        self.ngram_mixer_loss_weight = ngram_mixer_loss_weight
 
         self.embed = nn.Embedding(vocab_size, dim)
         self.attn_qkv = nn.Linear(dim, dim * 3, bias=False)
@@ -295,6 +302,16 @@ class GolfModel(nn.Module):
 
         if not tie_embeddings:
             self.lm_head = nn.Linear(dim, vocab_size, bias=False)
+
+        # N-gram gate head: 7 experts (1 neural + 6 n-gram orders 2-7)
+        if ngram_enabled:
+            self.ngram_gate = nn.Linear(dim, 7, bias=True)
+            nn.init.zeros_(self.ngram_gate.weight)
+            nn.init.zeros_(self.ngram_gate.bias)
+            with torch.no_grad():
+                self.ngram_gate.bias[0] = 2.0  # bias toward neural at init
+        else:
+            self.ngram_gate = None
 
         rope_cos, rope_sin = precompute_rope_freqs(self.head_dim, max_seq_len, theta=rope_base)
         self.register_buffer("rope_cos", rope_cos)
@@ -321,7 +338,13 @@ class GolfModel(nn.Module):
         x = x + moe_out
         return x, reg_loss
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor | None = None) -> Tensor:
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor | None = None,
+        ngram_order_p: Tensor | None = None,
+        ngram_order_valid: Tensor | None = None,
+    ) -> Tensor:
         x = self.embed(input_ids)
         total_sigreg_loss = 0.0
 
@@ -333,6 +356,7 @@ class GolfModel(nn.Module):
                 x, reg_loss = self._recurrence_step(x, step_embed)
             total_sigreg_loss += reg_loss
 
+        # x is the final hidden state (B, T, dim) — used for both logits and gate
         if self.tie_embeddings:
             logits = F.linear(x, self.embed.weight)
         else:
@@ -340,8 +364,175 @@ class GolfModel(nn.Module):
 
         if target_ids is not None:
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1))
-            return ce_loss + (0.1 * total_sigreg_loss)
+            total_loss = ce_loss + (0.1 * total_sigreg_loss)
+
+            # N-gram mixer loss
+            if self.ngram_gate is not None and ngram_order_p is not None:
+                gate_logits = self.ngram_gate(x)  # (B, T, 7)
+                mix_loss = ngram_mixer_loss(
+                    gate_logits, logits.view(-1, logits.size(-1)),
+                    target_ids, ngram_order_p, ngram_order_valid,
+                )
+                total_loss = total_loss + self.ngram_mixer_loss_weight * mix_loss
+
+            return total_loss
         return logits
+
+    def forward_with_gate(self, input_ids: Tensor) -> tuple[Tensor, Tensor | None]:
+        """Forward pass returning logits and gate logits (for eval with mixer)."""
+        x = self.embed(input_ids)
+        for t in range(self.depth):
+            step_embed = self.timestep_embed[t]
+            x, _ = self._recurrence_step(x, step_embed)
+
+        if self.tie_embeddings:
+            logits = F.linear(x, self.embed.weight)
+        else:
+            logits = self.lm_head(x)
+
+        gate_logits = self.ngram_gate(x) if self.ngram_gate is not None else None
+        return logits, gate_logits
+
+
+# =============================================================================
+# BackoffNgramMixer — frozen n-gram oracle with learned gate
+# =============================================================================
+class BackoffNgramMixer:
+    """Multi-order n-gram backoff oracle (orders 2-7). GPU-native hash tables.
+
+    Prefilled once from training data, then frozen. Provides per-token
+    n-gram probabilities that a learned gate head mixes with neural predictions.
+    """
+
+    def __init__(self, vocab_size: int = 1024, device: str = "cuda",
+                 buckets: int = 1_048_576):
+        self.V = vocab_size
+        self.device = torch.device(device)
+        self.total_tokens = 0
+        self.max_order = 7
+        self.min_order = 2
+        self.BUCKETS = buckets
+        self.primes = torch.tensor(
+            [36313, 27191, 51647, 81929, 131071, 174763, 233017],
+            dtype=torch.long, device=self.device,
+        )
+        self.mask = self.BUCKETS - 1
+        self.ctx_counts = [
+            torch.zeros(self.BUCKETS, dtype=torch.int32, device=self.device)
+            for _ in range(6)
+        ]
+        self.full_counts = [
+            torch.zeros(self.BUCKETS, dtype=torch.int32, device=self.device)
+            for _ in range(6)
+        ]
+
+    @torch.no_grad()
+    def update(self, tokens: Tensor) -> None:
+        """Count n-gram occurrences from a 1D token stream."""
+        t = tokens.to(device=self.device, dtype=torch.long).reshape(-1)
+        n = t.numel()
+        if n == 0:
+            return
+        self.total_tokens += n
+        for oi, order in enumerate(range(self.min_order, self.max_order + 1)):
+            if n < order:
+                continue
+            cw = order - 1
+            length = n - order + 1
+            ctx_hash = torch.zeros(length, dtype=torch.long, device=self.device)
+            for k in range(cw):
+                ctx_hash.bitwise_xor_(t[k : k + length] * self.primes[k])
+            ctx_key = ctx_hash & self.mask
+            full_key = (ctx_hash ^ (t[order - 1 : order - 1 + length] * self.primes[cw])) & self.mask
+            ones = torch.ones(length, dtype=torch.int32, device=self.device)
+            self.ctx_counts[oi].scatter_add_(0, ctx_key, ones)
+            self.full_counts[oi].scatter_add_(0, full_key, ones)
+
+    @torch.no_grad()
+    def ngram_probs(self, x_batch: Tensor, y_batch: Tensor) -> tuple[Tensor, Tensor]:
+        """Compute per-order n-gram probabilities for target tokens.
+
+        Returns:
+            order_p: (B, T, 6) — probability estimates per order
+            order_valid: (B, T, 6) — whether each order has sufficient counts
+        """
+        bsz, slen = x_batch.shape
+        dev = x_batch.device
+        x = x_batch.long()
+        y = y_batch.long()
+
+        order_p = torch.full((bsz, slen, 6), 1.0 / self.V, device=dev)
+        order_valid = torch.zeros(bsz, slen, 6, dtype=torch.bool, device=dev)
+
+        for oi_rev in range(5, -1, -1):
+            order = oi_rev + 2
+            cw = order - 1
+            if slen < cw:
+                continue
+            ctx_hash = torch.zeros(bsz, slen, dtype=torch.long, device=dev)
+            for k in range(cw):
+                shift = cw - 1 - k
+                if shift > 0:
+                    ctx_hash[:, shift:].bitwise_xor_(x[:, : slen - shift] * self.primes[k])
+                else:
+                    ctx_hash.bitwise_xor_(x * self.primes[k])
+            ctx_key = (ctx_hash & self.mask).long()
+            full_key = ((ctx_hash ^ (y * self.primes[cw])) & self.mask).long()
+            ctx_c = self.ctx_counts[oi_rev][ctx_key.reshape(-1)].float().reshape(bsz, slen)
+            full_c = self.full_counts[oi_rev][full_key.reshape(-1)].float().reshape(bsz, slen)
+            p = torch.minimum(full_c, ctx_c) / ctx_c.clamp(min=1.0)
+            p = p.clamp(0.0, 1.0)
+            valid = ctx_c >= 2
+            if cw > 0:
+                valid[:, :cw] = False
+            order_p[..., oi_rev] = torch.where(valid, p, order_p[..., oi_rev])
+            order_valid[..., oi_rev] = valid
+
+        return order_p, order_valid
+
+
+def ngram_mixer_loss(
+    gate_logits: Tensor,
+    neural_logits: Tensor,
+    target_ids: Tensor,
+    order_p: Tensor,
+    order_valid: Tensor,
+    neural_floor: float = 0.05,
+) -> Tensor:
+    """Compute mixed NLL from neural + n-gram expert probabilities.
+
+    Args:
+        gate_logits: (B, T, 7) from the gate head — 1 neural + 6 n-gram orders
+        neural_logits: (B*T, V) raw logits from the model
+        target_ids: (B, T) target token ids
+        order_p: (B, T, 6) n-gram probabilities per order
+        order_valid: (B, T, 6) validity mask per order
+    """
+    bsz, slen = target_ids.shape
+
+    # Neural probability for the correct token
+    neural_lp = F.log_softmax(neural_logits.float(), dim=-1)
+    neural_p = neural_lp.gather(1, target_ids.reshape(-1, 1)).squeeze(1).exp()
+    neural_p = neural_p.reshape(bsz, slen)
+
+    # Stack expert probabilities: [neural, order_2, ..., order_7]
+    expert_p = torch.cat([neural_p.unsqueeze(-1), order_p], dim=-1)  # (B, T, 7)
+    valid_mask = torch.cat([
+        torch.ones(bsz, slen, 1, device=gate_logits.device, dtype=torch.bool),
+        order_valid,
+    ], dim=-1)  # (B, T, 7)
+
+    # Masked softmax over gate logits
+    masked_logits = gate_logits.masked_fill(~valid_mask, -1e9)
+    weights = F.softmax(masked_logits, dim=-1)
+
+    # Floor the neural weight at neural_floor to prevent collapse
+    neural_w = neural_floor + (1.0 - neural_floor) * weights[..., :1]
+    other_w = (1.0 - neural_floor) * weights[..., 1:]
+    weights = torch.cat([neural_w, other_w], dim=-1)
+
+    mixed_p = (weights * expert_p).sum(dim=-1)
+    return -torch.log(mixed_p.clamp(min=1e-12)).mean()
 
 
 # =============================================================================
@@ -423,17 +614,20 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
     seq_len: int | None = None,
+    mixer: BackoffNgramMixer | None = None,
 ) -> tuple[float, float]:
-    """Compute val_loss (nats) and val_bpb (bits/byte) on validation tokens."""
+    """Compute val_loss (nats) and val_bpb (bits/byte) on validation tokens.
+    If mixer is provided and model has ngram_gate, uses mixed predictions."""
     if seq_len is None:
         seq_len = args.train_seq_len
     model.eval()
+    raw_model = model.module if hasattr(model, "module") else model
+    use_mixer = mixer is not None and raw_model.ngram_gate is not None and mixer.total_tokens > 0
 
     bb = base_bytes_lut.to(device)
     hls = has_leading_space_lut.to(device)
     isb = is_boundary_token_lut.to(device)
 
-    # Use float32 on MPS (no float64 support), float64 on CUDA/CPU
     acc_dtype = torch.float32 if device.type == "mps" else torch.float64
     total_loss = torch.zeros((), device=device, dtype=acc_dtype)
     total_tokens = torch.zeros((), device=device, dtype=acc_dtype)
@@ -452,8 +646,31 @@ def eval_val(
         y = local[1:].reshape(-1, seq_len)
         batch_token_count = y.numel()
 
-        logits = model(x)
-        batch_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        if use_mixer:
+            logits, gate_logits = raw_model.forward_with_gate(x)
+            # Compute mixed NLL using n-gram probabilities
+            order_p, order_valid = mixer.ngram_probs(x, y)
+            bsz, slen = y.shape
+            neural_lp = F.log_softmax(logits.float(), dim=-1)
+            neural_p = neural_lp.gather(2, y.unsqueeze(2)).squeeze(2)
+            neural_p = neural_p.exp()
+            expert_p = torch.cat([neural_p.unsqueeze(-1), order_p], dim=-1)
+            valid_mask = torch.cat([
+                torch.ones(bsz, slen, 1, device=device, dtype=torch.bool),
+                order_valid,
+            ], dim=-1)
+            masked = gate_logits.masked_fill(~valid_mask, -1e9)
+            weights = F.softmax(masked, dim=-1)
+            neural_w = 0.05 + 0.95 * weights[..., :1]
+            other_w = 0.95 * weights[..., 1:]
+            weights = torch.cat([neural_w, other_w], dim=-1)
+            mixed_p = (weights * expert_p).sum(dim=-1)
+            batch_nll = -torch.log(mixed_p.clamp(min=1e-12))
+            batch_loss = batch_nll.sum() / batch_token_count
+        else:
+            logits = raw_model(x)
+            batch_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+
         total_loss += batch_loss.to(acc_dtype) * batch_token_count
         total_tokens += batch_token_count
 
@@ -551,6 +768,29 @@ def main() -> None:
         args.tokenizer_path, args.vocab_size
     )
 
+    # --- N-gram mixer (frozen oracle) ---
+    mixer = None
+    if args.ngram_enabled:
+        log0("Prefilling n-gram oracle from training shards...")
+        t_prefill = time.perf_counter()
+        mixer = BackoffNgramMixer(
+            vocab_size=args.vocab_size, device=str(device),
+            buckets=args.ngram_buckets,
+        )
+        PREFILL_CHUNK = 10_000_000
+        for shard_path in sorted(glob.glob(args.train_files)):
+            raw = np.fromfile(shard_path, dtype="<u2")
+            for off in range(0, len(raw), PREFILL_CHUNK):
+                chunk = torch.from_numpy(
+                    raw[off : off + PREFILL_CHUNK].astype(np.int32)
+                ).to(device)
+                mixer.update(chunk)
+                del chunk
+            del raw
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        log0(f"  Prefilled {mixer.total_tokens:,} tokens in {time.perf_counter() - t_prefill:.1f}s")
+
     # --- Model ---
     model = GolfModel(
         vocab_size=args.vocab_size,
@@ -563,6 +803,8 @@ def main() -> None:
         max_seq_len=args.train_seq_len,
         tie_embeddings=args.tie_embeddings,
         rope_base=args.rope_base,
+        ngram_enabled=args.ngram_enabled,
+        ngram_mixer_loss_weight=args.ngram_mixer_loss_weight,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -587,6 +829,8 @@ def main() -> None:
     ]
     if not args.tie_embeddings and hasattr(raw_model, "lm_head"):
         scalar_params.append(raw_model.lm_head.weight)
+    if raw_model.ngram_gate is not None:
+        scalar_params.extend([raw_model.ngram_gate.weight, raw_model.ngram_gate.bias])
 
     opt_muon = Muon(matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, backend_steps=5)
     opt_adam = torch.optim.AdamW(scalar_params, lr=args.adam_lr, betas=(0.9, 0.95))
@@ -635,11 +879,18 @@ def main() -> None:
             x = tokens[:-1].reshape(micro_batch_seqs, args.train_seq_len)
             y = tokens[1:].reshape(micro_batch_seqs, args.train_seq_len)
 
+            # Compute n-gram probabilities (frozen, no grad)
+            ngram_kw = {}
+            if mixer is not None and mixer.total_tokens > 0:
+                with torch.no_grad():
+                    order_p, order_valid = mixer.ngram_probs(x, y)
+                ngram_kw = dict(ngram_order_p=order_p, ngram_order_valid=order_valid)
+
             if device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = model(x, y) * grad_scale
+                    loss = model(x, y, **ngram_kw) * grad_scale
             else:
-                loss = model(x, y) * grad_scale
+                loss = model(x, y, **ngram_kw) * grad_scale
             loss.backward()
             accum_loss += loss.item()
             total_tokens_seen += y.numel() * world_size
@@ -662,6 +913,7 @@ def main() -> None:
             val_loss, val_bpb = eval_val(
                 args, raw_model, device, val_tokens,
                 base_bytes_lut, has_leading_space_lut, is_boundary_lut,
+                mixer=mixer,
             )
             log(f"  val_loss={val_loss:.4f} val_bpb={val_bpb:.4f}")
 
@@ -711,12 +963,14 @@ def main() -> None:
         max_seq_len=args.train_seq_len,
         tie_embeddings=args.tie_embeddings,
         rope_base=args.rope_base,
+        ngram_enabled=args.ngram_enabled,
     ).to(device)
     rt_model.load_state_dict(roundtrip_sd, strict=False)
 
     q_val_loss, q_val_bpb = eval_val(
         args, rt_model, device, val_tokens,
         base_bytes_lut, has_leading_space_lut, is_boundary_lut,
+        mixer=mixer,
     )
 
     eval_time_ms = 1000.0 * (time.perf_counter() - t_qeval)

@@ -18,6 +18,8 @@ from train_gpt import (
     SpeedrunMoE,
     Muon,
     Hyperparameters,
+    BackoffNgramMixer,
+    ngram_mixer_loss,
     zeropower_via_newtonschulz5,
     sigreg_loss,
     quantize_int6_per_row,
@@ -94,6 +96,44 @@ def test_timestep_embed():
     diffs = (model.timestep_embed[1:] - model.timestep_embed[:-1]).abs().sum(dim=1)
     assert (diffs > 0).all(), "Timestep embeddings should differ across steps"
     print(f"  shape (4, 64), all steps distinct (OK)")
+
+
+def test_ngram_mixer():
+    """BackoffNgramMixer should count n-grams and produce valid probabilities."""
+    # Use CPU — mixer uses int32 scatter_add which MPS handles fine, but keep it simple
+    dev = "cpu"
+    mixer = BackoffNgramMixer(vocab_size=256, device=dev, buckets=4096)
+    # Feed some tokens
+    tokens = torch.randint(0, 256, (10000,))
+    mixer.update(tokens)
+    assert mixer.total_tokens == 10000
+
+    # Query probabilities
+    x = torch.randint(0, 256, (2, 32))
+    y = torch.randint(0, 256, (2, 32))
+    order_p, order_valid = mixer.ngram_probs(x, y)
+    assert order_p.shape == (2, 32, 6)
+    assert order_valid.shape == (2, 32, 6)
+    assert (order_p >= 0).all() and (order_p <= 1).all()
+    print(f"  prefilled {mixer.total_tokens} tokens, probs shape {order_p.shape} (OK)")
+
+    # Test mixer loss computation
+    model = GolfModel(
+        vocab_size=256, dim=64, num_heads=4, depth=2, num_experts=8,
+        mlp_mult=2, top_k=2, max_seq_len=32, ngram_enabled=True,
+    )
+    ids = torch.randint(0, 256, (2, 32))
+    logits = model(ids)  # (2, 32, 256)
+    gate_logits = model.ngram_gate(torch.randn(2, 32, 64))  # (2, 32, 7)
+    loss = ngram_mixer_loss(gate_logits, logits.view(-1, 256), ids, order_p, order_valid)
+    assert loss.ndim == 0 and not torch.isnan(loss)
+    print(f"  mixer loss = {loss.item():.4f} (OK)")
+
+    # Test forward with ngram
+    loss_with = model(ids, ids, ngram_order_p=order_p, ngram_order_valid=order_valid)
+    loss_without = model(ids, ids)
+    assert not torch.isnan(loss_with)
+    print(f"  forward with ngram: {loss_with.item():.4f}, without: {loss_without.item():.4f} (OK)")
 
 
 def test_model_forward():
@@ -279,6 +319,7 @@ def main():
         ("SigReg Loss", test_sigreg),
         ("Passthrough Expert", test_passthrough_expert),
         ("Timestep Embedding", test_timestep_embed),
+        ("N-gram Mixer", test_ngram_mixer),
         ("Model Forward", test_model_forward),
         ("Backward Pass", test_backward),
         ("Muon Optimizer", test_muon_step),
