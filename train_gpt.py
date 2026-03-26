@@ -357,6 +357,10 @@ class GolfModel(nn.Module):
 
         x = self.final_norm(x)
 
+        # SigReg on final hidden state: keeps tied embedding space well-spread
+        if self.training and self.sigreg_weight > 0:
+            total_sigreg += sigreg_loss(x.view(-1, self.dim))
+
         if self.tie_embeddings:
             logits = F.linear(x, self.embed.weight)
         else:
