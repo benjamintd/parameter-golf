@@ -1,0 +1,9 @@
+{
+  "name": "LeReMix: Depth-Recurrent Mixture of Experts",
+  "author": "benjamintd",
+  "github_id": "benjamintd",
+  "blurb": "Universal Transformer-style depth recurrence (12 virtual layers from 1 physical block) with 64-expert MoE including a parameter-free passthrough expert for implicit ACT. Timestep embeddings enable depth-aware routing. SigReg distributional regularization prevents MoE collapse. Dual optimizer: Muon + AdamW. int6+zlib compression.",
+  "date": "2026-03-26",
+  "val_bpb": null,
+  "bytes_total": null
+}
