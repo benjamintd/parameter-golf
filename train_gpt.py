@@ -244,26 +244,27 @@ class SpeedrunMoE(nn.Module):
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
 
-        flat_experts = selected_experts.view(-1)
-        flat_weights = routing_weights.view(-1, 1)
-        flat_tokens = x_flat.repeat_interleave(self.top_k, dim=0)
+        out = torch.zeros_like(x_flat)
 
-        is_real = flat_experts > 0
-        real_mask = is_real.nonzero(as_tuple=True)[0]
+        for k in range(self.top_k):
+            expert_indices = selected_experts[:, k]    # (N,)
+            weights = routing_weights[:, k].unsqueeze(-1)  # (N, 1)
 
-        expert_out = flat_tokens.clone()
+            # Expert 0 = passthrough (identity)
+            pass_mask = expert_indices == 0
+            if pass_mask.any():
+                out[pass_mask] += x_flat[pass_mask] * weights[pass_mask]
 
-        if real_mask.numel() > 0:
-            real_tokens = flat_tokens[real_mask]
-            real_expert_ids = flat_experts[real_mask] - 1
-            w1_sel = self.w1[real_expert_ids]
-            w2_sel = self.w2[real_expert_ids]
-            h = F.relu(torch.bmm(real_tokens.unsqueeze(1), w1_sel).squeeze(1))
-            real_out = torch.bmm(h.unsqueeze(1), w2_sel).squeeze(1)
-            expert_out[real_mask] = real_out
+            # Real experts: loop per expert, matmul per group
+            for i in range(self.num_real_experts):
+                token_mask = expert_indices == (i + 1)
+                if not token_mask.any():
+                    continue
+                tokens_for_expert = x_flat[token_mask]
+                h = F.relu(tokens_for_expert @ self.w1[i])
+                expert_out = h @ self.w2[i]
+                out[token_mask] += expert_out * weights[token_mask]
 
-        weighted_out = expert_out * flat_weights
-        out = weighted_out.view(N, self.top_k, D).sum(dim=1)
         return out.view(B, T, D), latent_reg_loss
 
 
