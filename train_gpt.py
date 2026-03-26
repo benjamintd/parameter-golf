@@ -20,6 +20,12 @@ import time
 import zlib
 from pathlib import Path
 
+try:
+    import zstandard
+    _COMPRESSOR = "zstd"
+except ImportError:
+    _COMPRESSOR = "zlib"
+
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -54,6 +60,8 @@ class Hyperparameters:
     # Validation
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 200))
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 10))
 
     # Model
@@ -725,6 +733,109 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
+@torch.no_grad()
+def eval_val_sliding(
+    args: Hyperparameters,
+    model: nn.Module,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    mixer: BackoffNgramMixer | None = None,
+) -> tuple[float, float]:
+    """Sliding window eval — each token gets (window - stride) tokens of context.
+    With stride=64, window=2048: each scored token sees 1984 context tokens."""
+    window = args.eval_seq_len
+    stride = args.eval_stride
+    if stride <= 0 or stride >= window:
+        return eval_val(args, model, device, val_tokens,
+                        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                        mixer=mixer)
+
+    model.eval()
+    raw_model = model.module if hasattr(model, "module") else model
+    use_mixer = raw_model.ngram_gate is not None
+
+    eval_mixer = None
+    if use_mixer and mixer is not None:
+        eval_mixer = BackoffNgramMixer(
+            vocab_size=args.vocab_size, device=str(device), buckets=mixer.BUCKETS,
+        )
+
+    bb = base_bytes_lut.to(device)
+    hls = has_leading_space_lut.to(device)
+    isb = is_boundary_token_lut.to(device)
+
+    acc_dtype = torch.float32 if device.type == "mps" else torch.float64
+    total_loss = torch.zeros((), device=device, dtype=acc_dtype)
+    total_tokens = torch.zeros((), device=device, dtype=acc_dtype)
+    total_bytes = torch.zeros((), device=device, dtype=acc_dtype)
+
+    n = val_tokens.numel()
+
+    for start in range(0, n - window, stride):
+        chunk = val_tokens[start : start + window].to(device=device, dtype=torch.int64)
+        x = chunk[:-1].unsqueeze(0)  # (1, window-1)
+        y = chunk[1:].unsqueeze(0)   # (1, window-1)
+
+        # Only score the LAST `stride` tokens (the rest are context)
+        if eval_mixer is not None and eval_mixer.total_tokens > 0:
+            logits, gate_logits = raw_model.forward_with_gate(x)
+            # Score only last `stride` positions
+            logits_s = logits[:, -stride:]
+            y_s = y[:, -stride:]
+            gate_s = gate_logits[:, -stride:] if gate_logits is not None else None
+            x_ctx = x[:, -stride - 1:-1]  # prev tokens for byte counting
+
+            order_p, order_valid = eval_mixer.ngram_probs(
+                x[:, -stride:], y_s  # context for ngram is the input at scored positions
+            )
+            neural_lp = F.log_softmax(logits_s.float(), dim=-1)
+            neural_p = neural_lp.gather(2, y_s.unsqueeze(2)).squeeze(2).exp()
+            expert_p = torch.cat([neural_p.unsqueeze(-1), order_p], dim=-1)
+            valid_mask = torch.cat([
+                torch.ones(1, stride, 1, device=device, dtype=torch.bool),
+                order_valid,
+            ], dim=-1)
+            masked = gate_s.masked_fill(~valid_mask, -1e9)
+            weights = F.softmax(masked, dim=-1)
+            neural_w = 0.05 + 0.95 * weights[..., :1]
+            other_w = 0.95 * weights[..., 1:]
+            weights = torch.cat([neural_w, other_w], dim=-1)
+            mixed_p = (weights * expert_p).sum(dim=-1)
+            batch_nll = -torch.log(mixed_p.clamp(min=1e-12))
+            batch_loss = batch_nll.sum()
+        else:
+            logits = raw_model(x)
+            logits_s = logits[:, -stride:]
+            y_s = y[:, -stride:]
+            batch_loss = F.cross_entropy(
+                logits_s.reshape(-1, logits_s.size(-1)), y_s.reshape(-1), reduction="sum"
+            )
+
+        scored = stride
+        total_loss += batch_loss.to(acc_dtype)
+        total_tokens += scored
+
+        # Byte counting for scored tokens
+        token_bytes = bb[y_s].to(dtype=torch.int64)
+        prev_ids = x[:, -stride:]
+        space_adj = (hls[y_s] & ~isb[prev_ids]).to(dtype=torch.int64)
+        total_bytes += (token_bytes + space_adj).to(acc_dtype).sum()
+
+        # Update eval oracle with scored tokens
+        if eval_mixer is not None:
+            eval_mixer.update(chunk[-stride:])
+
+    val_loss = total_loss / total_tokens
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = total_tokens.item() / total_bytes.item()
+
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
 # =============================================================================
 # Learning rate schedule
 # =============================================================================
@@ -837,7 +948,7 @@ def main() -> None:
         num_layers=args.num_layers,
         mlp_mult=args.mlp_mult,
         depth=args.depth,
-        max_seq_len=args.train_seq_len,
+        max_seq_len=max(args.train_seq_len, args.eval_seq_len),
         tie_embeddings=args.tie_embeddings,
         rope_base=args.rope_base,
         ngram_enabled=args.ngram_enabled,
@@ -960,14 +1071,20 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_sd, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+
+    if _COMPRESSOR == "zstd":
+        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+        comp_label = "int6+zstd22"
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
+        comp_label = "int6+zlib9"
 
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         total_bytes = quant_file_bytes + code_bytes
-        log(f"Serialized model int6+zlib: {quant_file_bytes} bytes")
+        log(f"Serialized model {comp_label}: {quant_file_bytes} bytes")
         log(f"Total submission size: {total_bytes} bytes (cap: 16,000,000)")
         if total_bytes > 16_000_000:
             log(f"WARNING: exceeds 16MB cap by {total_bytes - 16_000_000} bytes!")
@@ -976,7 +1093,11 @@ def main() -> None:
     log0("Roundtrip evaluation...")
     t_qeval = time.perf_counter()
 
-    quant_loaded = torch.load(io.BytesIO(zlib.decompress(quant_blob)), weights_only=True)
+    if _COMPRESSOR == "zstd":
+        quant_decompressed = zstandard.ZstdDecompressor().decompress(quant_blob)
+    else:
+        quant_decompressed = zlib.decompress(quant_blob)
+    quant_loaded = torch.load(io.BytesIO(quant_decompressed), weights_only=True)
     roundtrip_sd = dequantize_state_dict(quant_loaded)
 
     rt_model = GolfModel(
@@ -987,13 +1108,14 @@ def main() -> None:
         num_layers=args.num_layers,
         mlp_mult=args.mlp_mult,
         depth=args.depth,
-        max_seq_len=args.train_seq_len,
+        max_seq_len=max(args.train_seq_len, args.eval_seq_len),
         tie_embeddings=args.tie_embeddings,
         rope_base=args.rope_base,
         ngram_enabled=args.ngram_enabled,
     ).to(device)
     rt_model.load_state_dict(roundtrip_sd, strict=False)
 
+    # Standard eval (non-overlapping chunks)
     q_val_loss, q_val_bpb = eval_val(
         args, rt_model, device, val_tokens,
         base_bytes_lut, has_leading_space_lut, is_boundary_lut,
@@ -1001,8 +1123,21 @@ def main() -> None:
     )
 
     eval_time_ms = 1000.0 * (time.perf_counter() - t_qeval)
-    log(f"final_int6_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{eval_time_ms:.0f}ms")
-    log(f"final_int6_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log(f"final_{comp_label}_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{eval_time_ms:.0f}ms")
+    log(f"final_{comp_label}_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # Sliding window eval (overlapping, much better context per token)
+    if args.eval_stride > 0 and args.eval_stride < args.eval_seq_len:
+        log0(f"Sliding window evaluation (window={args.eval_seq_len}, stride={args.eval_stride})...")
+        t_sw = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val_sliding(
+            args, rt_model, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_lut,
+            mixer=mixer,
+        )
+        sw_time_ms = 1000.0 * (time.perf_counter() - t_sw)
+        log(f"final_{comp_label}_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} stride:{args.eval_stride} eval_time:{sw_time_ms:.0f}ms")
+        log(f"final_{comp_label}_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
