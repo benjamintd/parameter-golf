@@ -244,36 +244,29 @@ class SpeedrunMoE(nn.Module):
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
 
-        # Flatten top-k selections
-        flat_experts = selected_experts.view(-1)            # (N*top_k,)
-        flat_weights = routing_weights.view(-1, 1)          # (N*top_k, 1)
-        flat_tokens = x_flat.repeat_interleave(self.top_k, dim=0)  # (N*top_k, D)
+        # Loop per expert — with 7 real experts each gets ~N/7 tokens,
+        # large enough matmuls to saturate H100, no gather OOM
+        out = torch.zeros_like(x_flat)
 
-        # Passthrough expert (index 0): identity
-        is_real = flat_experts > 0
-        expert_out = flat_tokens.clone()
+        for k in range(self.top_k):
+            expert_indices = selected_experts[:, k]
+            weights = routing_weights[:, k].unsqueeze(-1)
 
-        real_mask = is_real.nonzero(as_tuple=True)[0]
-        if real_mask.numel() > 0:
-            real_tokens = flat_tokens[real_mask]
-            real_expert_ids = flat_experts[real_mask] - 1
+            # Expert 0 = passthrough (identity, zero compute)
+            pass_mask = expert_indices == 0
+            if pass_mask.any():
+                out[pass_mask] += x_flat[pass_mask] * weights[pass_mask]
 
-            # Chunked gather+bmm to avoid OOM on large batches
-            # Each chunk gathers at most CHUNK tokens' worth of expert weights
-            CHUNK = 16384
-            real_out = torch.empty_like(real_tokens)
-            for start in range(0, real_mask.numel(), CHUNK):
-                end = min(start + CHUNK, real_mask.numel())
-                chunk_tokens = real_tokens[start:end]
-                chunk_ids = real_expert_ids[start:end]
-                w1_sel = self.w1[chunk_ids]
-                w2_sel = self.w2[chunk_ids]
-                h = F.relu(torch.bmm(chunk_tokens.unsqueeze(1), w1_sel).squeeze(1))
-                real_out[start:end] = torch.bmm(h.unsqueeze(1), w2_sel).squeeze(1)
-            expert_out[real_mask] = real_out
+            # Real experts
+            for i in range(self.num_real_experts):
+                mask = expert_indices == (i + 1)
+                if not mask.any():
+                    continue
+                tok = x_flat[mask]
+                h = F.relu(tok @ self.w1[i])
+                expert_out = h @ self.w2[i]
+                out[mask] += expert_out * weights[mask]
 
-        weighted_out = expert_out * flat_weights
-        out = weighted_out.view(N, self.top_k, D).sum(dim=1)
         return out.view(B, T, D), latent_reg_loss
 
 
