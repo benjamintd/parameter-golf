@@ -61,11 +61,11 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    depth = int(os.environ.get("DEPTH", 3))  # recurrence steps per layer group
+    depth = int(os.environ.get("DEPTH", 1))  # recurrence steps (1 = no recurrence)
     sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.01))
     # N-gram mixer
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
