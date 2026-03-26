@@ -458,6 +458,9 @@ class BackoffNgramMixer:
     def ngram_probs(self, x_batch: Tensor, y_batch: Tensor) -> tuple[Tensor, Tensor]:
         """Compute per-order n-gram probabilities for target tokens.
 
+        Precomputes all prime*token products, then builds context hashes
+        for all 6 orders using vectorized XOR reductions.
+
         Returns:
             order_p: (B, T, 6) — probability estimates per order
             order_valid: (B, T, 6) — whether each order has sufficient counts
@@ -467,32 +470,40 @@ class BackoffNgramMixer:
         x = x_batch.long()
         y = y_batch.long()
 
+        # Precompute prime*token for all 7 primes: (7, B, T)
+        px = self.primes[:, None, None] * x.unsqueeze(0)  # (7, B, T)
+
         order_p = torch.full((bsz, slen, 6), 1.0 / self.V, device=dev)
         order_valid = torch.zeros(bsz, slen, 6, dtype=torch.bool, device=dev)
 
-        for oi_rev in range(5, -1, -1):
-            order = oi_rev + 2
-            cw = order - 1
-            if slen < cw:
-                continue
+        for oi in range(6):  # orders 2..7
+            order = oi + 2
+            cw = order - 1  # context width
+
+            # Build context hash matching update(): XOR of primes[k]*x[offset+k] for k in 0..cw-1
+            # Original: for k in range(cw), shift = cw-1-k
+            #   ctx_hash[:, shift:] ^= x[:, :slen-shift] * primes[k]
             ctx_hash = torch.zeros(bsz, slen, dtype=torch.long, device=dev)
             for k in range(cw):
                 shift = cw - 1 - k
                 if shift > 0:
-                    ctx_hash[:, shift:].bitwise_xor_(x[:, : slen - shift] * self.primes[k])
+                    ctx_hash[:, shift:].bitwise_xor_(px[k, :, : slen - shift])
                 else:
-                    ctx_hash.bitwise_xor_(x * self.primes[k])
+                    ctx_hash.bitwise_xor_(px[k])
+
             ctx_key = (ctx_hash & self.mask).long()
-            full_key = ((ctx_hash ^ (y * self.primes[cw])) & self.mask).long()
-            ctx_c = self.ctx_counts[oi_rev][ctx_key.reshape(-1)].float().reshape(bsz, slen)
-            full_c = self.full_counts[oi_rev][full_key.reshape(-1)].float().reshape(bsz, slen)
+            full_key = ((ctx_hash ^ px[cw]) & self.mask).long()
+
+            ctx_c = self.ctx_counts[oi][ctx_key.reshape(-1)].float().reshape(bsz, slen)
+            full_c = self.full_counts[oi][full_key.reshape(-1)].float().reshape(bsz, slen)
+
             p = torch.minimum(full_c, ctx_c) / ctx_c.clamp(min=1.0)
-            p = p.clamp(0.0, 1.0)
             valid = ctx_c >= 2
             if cw > 0:
                 valid[:, :cw] = False
-            order_p[..., oi_rev] = torch.where(valid, p, order_p[..., oi_rev])
-            order_valid[..., oi_rev] = valid
+
+            order_p[..., oi] = torch.where(valid, p.clamp(0.0, 1.0), order_p[..., oi])
+            order_valid[..., oi] = valid
 
         return order_p, order_valid
 
@@ -900,12 +911,18 @@ def main() -> None:
             x = tokens[:-1].reshape(micro_batch_seqs, args.train_seq_len)
             y = tokens[1:].reshape(micro_batch_seqs, args.train_seq_len)
 
-            # N-gram mixer used only at eval (ngram_probs too slow for training)
+            # Compute n-gram probabilities (frozen, no grad)
+            ngram_kw = {}
+            if mixer is not None and mixer.total_tokens > 0:
+                with torch.no_grad():
+                    order_p, order_valid = mixer.ngram_probs(x, y)
+                ngram_kw = dict(ngram_order_p=order_p, ngram_order_valid=order_valid)
+
             if device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = model(x, y) * grad_scale
+                    loss = model(x, y, **ngram_kw) * grad_scale
             else:
-                loss = model(x, y) * grad_scale
+                loss = model(x, y, **ngram_kw) * grad_scale
             loss.backward()
             accum_loss += loss.item()
             total_tokens_seen += y.numel() * world_size
