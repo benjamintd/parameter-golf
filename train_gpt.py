@@ -60,13 +60,13 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    depth = int(os.environ.get("DEPTH", 2))
-    num_experts = int(os.environ.get("NUM_EXPERTS", 3))
-    mlp_mult = int(os.environ.get("MLP_MULT", 4))
-    expert_depth = int(os.environ.get("EXPERT_DEPTH", 2))  # layers per expert
-    top_k = int(os.environ.get("TOP_K", 2))
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    depth = int(os.environ.get("DEPTH", 3))  # recurrence steps per layer group
+    sigreg_weight = float(os.environ.get("SIGREG_WEIGHT", 0.01))
     # N-gram mixer
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "1")))
     ngram_mixer_loss_weight = float(os.environ.get("NGRAM_MIXER_LOSS_WEIGHT", 0.5))
@@ -214,151 +214,120 @@ def sigreg_loss(x: Tensor, num_projections: int = 32) -> Tensor:
 
 
 # =============================================================================
-# SpeedrunMoE — with passthrough expert 0
+# GolfModel — standard transformer with optional depth recurrence + SigReg
 # =============================================================================
-class SpeedrunMoE(nn.Module):
-    """
-    Mixture of Experts with a parameter-free passthrough expert (index 0).
-    Tokens routed to expert 0 skip all matmuls (identity). This acts as
-    learned adaptive halting for depth recurrence.
-    """
+class Block(nn.Module):
+    """Single transformer block: GQA attention + MLP."""
 
-    def __init__(self, dim: int, hidden_dim: int, num_experts: int = 64, top_k: int = 2,
-                 expert_depth: int = 1):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_cos: Tensor, rope_sin: Tensor):
         super().__init__()
-        self.num_experts = num_experts
-        self.num_real_experts = num_experts - 1
-        self.top_k = top_k
-        self.expert_depth = expert_depth
-        self.router = nn.Linear(dim, num_experts, bias=False)
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        self.kv_dim = self.head_dim * num_kv_heads
 
-        # Each expert is a multi-layer MLP: dim -> hidden -> hidden -> ... -> dim
-        # Layer 0: dim -> hidden_dim (up-projection)
-        # Layers 1..depth-2: hidden_dim -> hidden_dim (intermediate)
-        # Layer -1: hidden_dim -> dim (down-projection)
-        self.w_up = nn.Parameter(torch.empty(self.num_real_experts, dim, hidden_dim))
-        self.w_down = nn.Parameter(torch.empty(self.num_real_experts, hidden_dim, dim))
-        nn.init.orthogonal_(self.w_up)
-        nn.init.orthogonal_(self.w_down)
+        self.attn_q = nn.Linear(dim, dim, bias=False)
+        self.attn_kv = nn.Linear(dim, 2 * self.kv_dim, bias=False)
+        self.attn_proj = nn.Linear(dim, dim, bias=False)
 
-        # Intermediate layers (if expert_depth > 1)
-        if expert_depth > 1:
-            self.w_mid = nn.ParameterList([
-                nn.Parameter(torch.empty(self.num_real_experts, hidden_dim, hidden_dim))
-                for _ in range(expert_depth - 1)
-            ])
-            for w in self.w_mid:
-                nn.init.orthogonal_(w)
+        hidden = int(dim * mlp_mult)
+        self.mlp_up = nn.Linear(dim, hidden, bias=False)
+        self.mlp_down = nn.Linear(hidden, dim, bias=False)
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
-        B, T, D = x.shape
-        x_flat = x.view(-1, D)
-        N = x_flat.shape[0]
+        self.norm1 = nn.RMSNorm(dim)
+        self.norm2 = nn.RMSNorm(dim)
 
-        latent_reg_loss = sigreg_loss(x_flat)
+        self.register_buffer("rope_cos", rope_cos)
+        self.register_buffer("rope_sin", rope_sin)
 
-        routing_weights = F.softmax(self.router(x_flat), dim=-1)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    def forward(self, x: Tensor) -> Tensor:
+        B, T, C = x.shape
 
-        # Loop per expert — with 7 real experts each gets ~N/7 tokens,
-        # large enough matmuls to saturate H100, no gather OOM
-        out = torch.zeros_like(x_flat)
+        # Attention with GQA
+        x_norm = self.norm1(x)
+        q = self.attn_q(x_norm).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.attn_kv(x_norm).reshape(B, T, 2, self.num_kv_heads, self.head_dim)
+        k, v = kv[:, :, 0].transpose(1, 2), kv[:, :, 1].transpose(1, 2)
 
-        for k in range(self.top_k):
-            expert_indices = selected_experts[:, k]
-            weights = routing_weights[:, k].unsqueeze(-1)
+        q = apply_rope(q, self.rope_cos, self.rope_sin)
+        k = apply_rope(k, self.rope_cos, self.rope_sin)
 
-            # Expert 0 = passthrough (identity, zero compute)
-            pass_mask = expert_indices == 0
-            if pass_mask.any():
-                out[pass_mask] += x_flat[pass_mask] * weights[pass_mask]
+        # Expand KV heads for GQA
+        if self.num_kv_heads < self.num_heads:
+            reps = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(reps, dim=1)
+            v = v.repeat_interleave(reps, dim=1)
 
-            # Real experts (deep MLP: up -> [mid ->]* down)
-            for i in range(self.num_real_experts):
-                mask = expert_indices == (i + 1)
-                if not mask.any():
-                    continue
-                h = F.relu(x_flat[mask] @ self.w_up[i])
-                if self.expert_depth > 1:
-                    for w in self.w_mid:
-                        h = F.relu(h @ w[i])
-                out[mask] += (h @ self.w_down[i]) * weights[mask]
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).reshape(B, T, C)
+        x = x + self.attn_proj(attn_out)
 
-        return out.view(B, T, D), latent_reg_loss
+        # MLP
+        x = x + self.mlp_down(F.relu(self.mlp_up(self.norm2(x))).square())
+
+        return x
 
 
-# =============================================================================
-# GolfModel — depth-recurrent transformer with MoE
-# =============================================================================
 class GolfModel(nn.Module):
     def __init__(
         self,
         vocab_size: int = 1024,
         dim: int = 512,
         num_heads: int = 8,
-        depth: int = 2,
-        num_experts: int = 8,
-        mlp_mult: int = 4,
-        top_k: int = 2,
-        expert_depth: int = 3,
+        num_kv_heads: int = 4,
+        num_layers: int = 9,
+        mlp_mult: int = 3,
+        depth: int = 1,
         max_seq_len: int = 1024,
         tie_embeddings: bool = True,
         rope_base: float = 10000.0,
         ngram_enabled: bool = False,
         ngram_mixer_loss_weight: float = 0.5,
+        sigreg_weight: float = 0.01,
+        **kwargs,  # absorb unused params
     ):
         super().__init__()
+        self.num_layers = num_layers
         self.depth = depth
         self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
         self.tie_embeddings = tie_embeddings
         self.ngram_mixer_loss_weight = ngram_mixer_loss_weight
+        self.sigreg_weight = sigreg_weight
 
         self.embed = nn.Embedding(vocab_size, dim)
-        self.attn_qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.attn_proj = nn.Linear(dim, dim, bias=False)
-        self.shared_moe = SpeedrunMoE(dim, hidden_dim=dim * mlp_mult, num_experts=num_experts, top_k=top_k, expert_depth=expert_depth)
-        self.norm = nn.RMSNorm(dim)
+        self.final_norm = nn.RMSNorm(dim)
 
         if not tie_embeddings:
             self.lm_head = nn.Linear(dim, vocab_size, bias=False)
 
-        # N-gram gate head: 7 experts (1 neural + 6 n-gram orders 2-7)
+        # N-gram gate head
         if ngram_enabled:
             self.ngram_gate = nn.Linear(dim, 7, bias=True)
             nn.init.zeros_(self.ngram_gate.weight)
             nn.init.zeros_(self.ngram_gate.bias)
             with torch.no_grad():
-                self.ngram_gate.bias[0] = 2.0  # bias toward neural at init
+                self.ngram_gate.bias[0] = 2.0
         else:
             self.ngram_gate = None
 
-        rope_cos, rope_sin = precompute_rope_freqs(self.head_dim, max_seq_len, theta=rope_base)
-        self.register_buffer("rope_cos", rope_cos)
-        self.register_buffer("rope_sin", rope_sin)
-        self.register_buffer("timestep_embed", precompute_timestep_embed(depth, dim))
+        head_dim = dim // num_heads
+        rope_cos, rope_sin = precompute_rope_freqs(head_dim, max_seq_len, theta=rope_base)
 
-    def _recurrence_step(self, x: Tensor, step_embed: Tensor) -> tuple[Tensor, Tensor]:
-        B, T, C = x.shape
-        x = x + step_embed
-        x_norm = self.norm(x)
+        # Timestep embeddings for depth recurrence
+        if depth > 1:
+            self.register_buffer("timestep_embed", precompute_timestep_embed(depth, dim))
 
-        qkv = self.attn_qkv(x_norm).reshape(B, T, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        q = apply_rope(q, self.rope_cos, self.rope_sin)
-        k = apply_rope(k, self.rope_cos, self.rope_sin)
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_cos, rope_sin)
+            for _ in range(num_layers)
+        ])
 
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        attn_out = attn_out.transpose(1, 2).reshape(B, T, C)
-        attn_out = self.attn_proj(attn_out)
-        x = x + attn_out
-
-        moe_out, reg_loss = self.shared_moe(self.norm(x))
-        x = x + moe_out
-        return x, reg_loss
+    def _run_blocks(self, x: Tensor) -> Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return x
 
     def forward(
         self,
@@ -368,17 +337,26 @@ class GolfModel(nn.Module):
         ngram_order_valid: Tensor | None = None,
     ) -> Tensor:
         x = self.embed(input_ids)
-        total_sigreg_loss = 0.0
+        x = F.rms_norm(x, (x.size(-1),))
 
+        total_sigreg = 0.0
         for t in range(self.depth):
-            step_embed = self.timestep_embed[t]
-            if self.training:
-                x, reg_loss = checkpoint(self._recurrence_step, x, step_embed, use_reentrant=False)
-            else:
-                x, reg_loss = self._recurrence_step(x, step_embed)
-            total_sigreg_loss += reg_loss
+            # Timestep signal for recurrence
+            if self.depth > 1:
+                x = x + self.timestep_embed[t]
 
-        # x is the final hidden state (B, T, dim) — used for both logits and gate
+            # Run all blocks
+            if self.training and self.depth > 1:
+                x = checkpoint(self._run_blocks, x, use_reentrant=False)
+            else:
+                x = self._run_blocks(x)
+
+            # SigReg between recurrence steps to prevent representation collapse
+            if self.depth > 1 and t < self.depth - 1:
+                total_sigreg += sigreg_loss(x.view(-1, self.dim))
+
+        x = self.final_norm(x)
+
         if self.tie_embeddings:
             logits = F.linear(x, self.embed.weight)
         else:
@@ -386,11 +364,10 @@ class GolfModel(nn.Module):
 
         if target_ids is not None:
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1))
-            total_loss = ce_loss + (0.1 * total_sigreg_loss)
+            total_loss = ce_loss + self.sigreg_weight * total_sigreg
 
-            # N-gram mixer loss
             if self.ngram_gate is not None and ngram_order_p is not None:
-                gate_logits = self.ngram_gate(x)  # (B, T, 7)
+                gate_logits = self.ngram_gate(x)
                 mix_loss = ngram_mixer_loss(
                     gate_logits, logits.view(-1, logits.size(-1)),
                     target_ids, ngram_order_p, ngram_order_valid,
@@ -403,9 +380,12 @@ class GolfModel(nn.Module):
     def forward_with_gate(self, input_ids: Tensor) -> tuple[Tensor, Tensor | None]:
         """Forward pass returning logits and gate logits (for eval with mixer)."""
         x = self.embed(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
         for t in range(self.depth):
-            step_embed = self.timestep_embed[t]
-            x, _ = self._recurrence_step(x, step_embed)
+            if self.depth > 1:
+                x = x + self.timestep_embed[t]
+            x = self._run_blocks(x)
+        x = self.final_norm(x)
 
         if self.tie_embeddings:
             logits = F.linear(x, self.embed.weight)
@@ -580,7 +560,10 @@ def dequantize_int6_per_row(q: Tensor, scale: Tensor) -> Tensor:
 def quantize_state_dict(state_dict: dict[str, Tensor], int6_keys: set[str] | None = None):
     """Quantize a state dict. Keys in int6_keys get int6, rest get fp16."""
     if int6_keys is None:
-        int6_keys = {k for k in (state_dict.keys() if hasattr(state_dict, 'keys') else []) if "shared_moe.w_" in k and "router" not in k}
+        # Int6 for large 2D weight matrices (attn, mlp), fp16 for embeddings/norms/small
+        int6_keys = {k for k, v in state_dict.items()
+                     if v.ndim == 2 and v.numel() > 4096
+                     and "embed" not in k and "ngram_gate" not in k and "norm" not in k}
     quantized = {}
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
@@ -835,16 +818,16 @@ def main() -> None:
         vocab_size=args.vocab_size,
         dim=args.model_dim,
         num_heads=args.num_heads,
-        depth=args.depth,
-        num_experts=args.num_experts,
+        num_kv_heads=args.num_kv_heads,
+        num_layers=args.num_layers,
         mlp_mult=args.mlp_mult,
-        top_k=args.top_k,
-        expert_depth=args.expert_depth,
+        depth=args.depth,
         max_seq_len=args.train_seq_len,
         tie_embeddings=args.tie_embeddings,
         rope_base=args.rope_base,
         ngram_enabled=args.ngram_enabled,
         ngram_mixer_loss_weight=args.ngram_mixer_loss_weight,
+        sigreg_weight=args.sigreg_weight,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -855,24 +838,16 @@ def main() -> None:
         model = DDP(model, device_ids=[local_rank])
     raw_model = model.module if distributed else model
 
-    # --- Optimizers: Muon for matrices, AdamW for scalars ---
-    matrix_params = [
-        raw_model.shared_moe.w_up,
-        raw_model.shared_moe.w_down,
-        raw_model.attn_qkv.weight,
-        raw_model.attn_proj.weight,
-    ]
-    if hasattr(raw_model.shared_moe, "w_mid"):
-        matrix_params.extend(list(raw_model.shared_moe.w_mid))
-    scalar_params = [
-        raw_model.embed.weight,
-        raw_model.norm.weight,
-        raw_model.shared_moe.router.weight,
-    ]
-    if not args.tie_embeddings and hasattr(raw_model, "lm_head"):
-        scalar_params.append(raw_model.lm_head.weight)
-    if raw_model.ngram_gate is not None:
-        scalar_params.extend([raw_model.ngram_gate.weight, raw_model.ngram_gate.bias])
+    # --- Optimizers: Muon for 2D+ matrices, AdamW for 1D/embeddings ---
+    matrix_params = []
+    scalar_params = []
+    for name, p in raw_model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2 and "embed" not in name and "ngram_gate" not in name and "norm" not in name:
+            matrix_params.append(p)
+        else:
+            scalar_params.append(p)
 
     opt_muon = Muon(matrix_params, lr=args.muon_lr, momentum=args.muon_momentum, backend_steps=5)
     opt_adam = torch.optim.AdamW(scalar_params, lr=args.adam_lr, betas=(0.9, 0.95))
@@ -998,10 +973,10 @@ def main() -> None:
         vocab_size=args.vocab_size,
         dim=args.model_dim,
         num_heads=args.num_heads,
-        depth=args.depth,
-        num_experts=args.num_experts,
+        num_kv_heads=args.num_kv_heads,
+        num_layers=args.num_layers,
         mlp_mult=args.mlp_mult,
-        top_k=args.top_k,
+        depth=args.depth,
         max_seq_len=args.train_seq_len,
         tie_embeddings=args.tie_embeddings,
         rope_base=args.rope_base,
